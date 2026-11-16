@@ -1,0 +1,146 @@
+name: FCAIB uptime
+
+# External availability check for https://fcaib.edu.ng, from outside the
+# server. The on-server watchdog (educore-site-watchdog.timer) cannot report
+# the server itself being down; this can.
+#
+# State lives in this workflow's own run history: a run FAILS only when the
+# site is down, so the streak of failed runs is the outage.
+#   first failed run            -> "DOWN" message
+#   every 12th consecutive fail -> "STILL DOWN" (about every 2 hours)
+#   first passing run after any -> "RECOVERED" with the downtime
+#
+# Manual test: run it from the Actions tab with a url input (e.g. a path that
+# 404s). Messages are then prefixed [TEST]. Run again with no input to recover.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Override the health URL (testing the alert path only)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write   # keepalive commit only
+  actions: read     # read this workflow's run history
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+env:
+  HEALTH_URL: https://fcaib.edu.ng/api/health
+  REALERT_EVERY: '12'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Probe the public health endpoint
+        id: probe
+        env:
+          OVERRIDE: ${{ github.event.inputs.url }}
+        run: |
+          set -u
+          URL="${OVERRIDE:-$HEALTH_URL}"
+          up=false; detail=""
+          # Three attempts, 20s apart: one network blip is not an outage.
+          for i in 1 2 3; do
+            body=$(curl -sS --max-time 20 -w '\nHTTP %{http_code}' "$URL" 2>&1) || true
+            if grep -q '"status":"healthy"' <<<"$body" && grep -q '"database":"connected"' <<<"$body"; then
+              up=true; break
+            fi
+            detail=$(tail -c 240 <<<"$body" | tr '\n' ' ')
+            if [ "$i" -lt 3 ]; then sleep 20; fi
+          done
+          echo "up=$up" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          { echo 'detail<<EOF_DETAIL'; echo "$detail"; echo 'EOF_DETAIL'; } >> "$GITHUB_OUTPUT"
+          echo "url=$URL up=$up ${detail:+detail=$detail}"
+
+      - name: Decide and notify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          UP: ${{ steps.probe.outputs.up }}
+          URL: ${{ steps.probe.outputs.url }}
+          DETAIL: ${{ steps.probe.outputs.detail }}
+          OVERRIDE: ${{ github.event.inputs.url }}
+        run: |
+          set -u
+          TAG=""; if [ -n "${OVERRIDE}" ]; then TAG="[TEST] "; fi
+
+          # Completed earlier runs, newest first, as "conclusion createdAt".
+          HIST=$(gh run list -R "$GITHUB_REPOSITORY" --workflow uptime.yml --status completed -L 60 \
+                   --json conclusion,createdAt,databaseId \
+                   -q ".[] | select(.databaseId != ${GITHUB_RUN_ID}) | select(.conclusion==\"success\" or .conclusion==\"failure\") | \"\(.conclusion) \(.createdAt)\"" 2>/dev/null || true)
+          STREAK=0; FIRST_FAIL=""
+          while read -r c t; do
+            [ -z "$c" ] && continue
+            [ "$c" = failure ] || break
+            STREAK=$((STREAK+1)); FIRST_FAIL="$t"
+          done <<<"$HIST"
+          echo "previous consecutive failures: $STREAK"
+
+          wat() { TZ=Africa/Lagos date -d "$1" '+%Y-%m-%d %H:%M WAT'; }
+          dur() { s=$(( $(date +%s) - $(date -d "$1" +%s) )); printf '%dh %02dm' $((s/3600)) $((s%3600/60)); }
+          send() {
+            if [ -z "${TG_TOKEN}" ] || [ -z "${TG_CHAT}" ]; then echo "::warning::Telegram secrets missing; not sent: $1"; return 0; fi
+            code=$(curl -sS -o /tmp/tg.out -w '%{http_code}' --max-time 20 -X POST \
+              "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "text=$1" \
+              --data-urlencode 'disable_web_page_preview=true' || echo 000)
+            [ "$code" = 200 ] && echo "Telegram delivered" || echo "::warning::Telegram HTTP $code"
+          }
+          RUN_LINK="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          if [ "$UP" = true ]; then
+            if [ "$STREAK" -gt 0 ]; then
+              send "$(printf '%sFCAIB SITE RECOVERED (external check)\n\n%s answers healthy again.\nDown since about %s, roughly %s.\n%s' \
+                "$TAG" "$URL" "$(wat "$FIRST_FAIL")" "$(dur "$FIRST_FAIL")" "$RUN_LINK")"
+            fi
+            exit 0
+          fi
+
+          N=$((STREAK+1))
+          if [ "$STREAK" -eq 0 ]; then
+            send "$(printf '%sFCAIB SITE DOWN (external check)\n\n%s failed 3 checks over about a minute, seen from outside the server.\nLast response: %s\n\nIf the server is up, the on-server watchdog will have more detail. If no message comes from it, the whole server may be down: check the Contabo panel.\n%s' \
+              "$TAG" "$URL" "${DETAIL:-none}" "$RUN_LINK")"
+          elif [ $(( N % REALERT_EVERY )) -eq 0 ]; then
+            send "$(printf '%sFCAIB SITE STILL DOWN (external check)\n\n%s has failed %s checks in a row, since about %s (%s).\nLast response: %s\n%s' \
+              "$TAG" "$URL" "$N" "$(wat "$FIRST_FAIL")" "$(dur "$FIRST_FAIL")" "${DETAIL:-none}" "$RUN_LINK")"
+          else
+            echo "Down for $N consecutive checks; already alerted, next re-alert at a multiple of ${REALERT_EVERY}."
+          fi
+          exit 1   # the failed run IS the state
+
+  keepalive:
+    # GitHub disables scheduled workflows in a repo with no activity for 60
+    # days. One empty commit when the last one is over 45 days old prevents it.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check last commit age
+        id: age
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          last=$(gh api "repos/${GITHUB_REPOSITORY}/commits?per_page=1" -q '.[0].commit.committer.date')
+          days=$(( ( $(date +%s) - $(date -d "$last" +%s) ) / 86400 ))
+          echo "last commit $last ($days days ago)"
+          echo "stale=$([ "$days" -ge 45 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        if: steps.age.outputs.stale == 'true'
+      - name: Keepalive commit
+        if: steps.age.outputs.stale == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keepalive so the uptime schedule stays enabled"
+          git push
